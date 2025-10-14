@@ -12,7 +12,7 @@ const PERTURB_SAMPLES = true;
 
 function positionalEncoding(x: tf.Tensor, L: number): tf.Tensor {
   return tf.tidy(() => {
-    const freqsTensor = tf.pow(2, tf.range(L, 'float32')).mul(Math.PI);
+    const freqsTensor = tf.pow(2, tf.range(0, L, 1, 'float32')).mul(Math.PI);
     const xExpanded = x.expandDims(-1);
     const sinComponents = tf.sin(xExpanded.mul(freqsTensor));
     const cosComponents = tf.cos(xExpanded.mul(freqsTensor));
@@ -28,7 +28,7 @@ function positionalEncoding(x: tf.Tensor, L: number): tf.Tensor {
 
 export interface SerializableWeights {
   weightData: ArrayBuffer;
-  weightSpecs: tf.io.WeightGroup[];
+  weightSpecs: tf.io.WeightsManifestEntry[];
 }
 
 interface TrainingMetrics {
@@ -64,36 +64,34 @@ export class NeRFModelWorker {
       }
     }
 
-    tf.tidy(() => {
-      const inputPointsDim = 3 * (1 + 2 * this.L_pos);
-      const inputDirectionsDim = 3 * (1 + 2 * this.L_dir);
+    const inputPointsDim = 3 * (1 + 2 * this.L_pos);
+    const inputDirectionsDim = 3 * (1 + 2 * this.L_dir);
 
-      const inputPoints = tf.input({ shape: [inputPointsDim], name: 'input_points' });
-      const inputDirections = tf.input({ shape: [inputDirectionsDim], name: 'input_directions' });
+    const inputPoints = tf.input({ shape: [inputPointsDim], name: 'input_points' });
+    const inputDirections = tf.input({ shape: [inputDirectionsDim], name: 'input_directions' });
 
-      let x: tf.SymbolicTensor = inputPoints;
-      for (let i = 0; i < 8; i++) {
-        x = tf.layers.dense({ units: 256, activation: 'relu', name: `point_dense_${i}` }).apply(x) as tf.SymbolicTensor;
-        if (i === 3) {
-          x = tf.layers.concatenate({ name: 'skip_connection' }).apply([x, inputPoints]) as tf.SymbolicTensor;
-        }
+    let x: tf.SymbolicTensor = inputPoints;
+    for (let i = 0; i < 8; i++) {
+      x = tf.layers.dense({ units: 256, activation: 'relu', name: `point_dense_${i}` }).apply(x) as tf.SymbolicTensor;
+      if (i === 3) {
+        x = tf.layers.concatenate({ name: 'skip_connection' }).apply([x, inputPoints]) as tf.SymbolicTensor;
       }
+    }
 
-      const sigma = tf.layers.dense({ units: 1, activation: 'relu', name: 'sigma_output' }).apply(x) as tf.SymbolicTensor;
-      const feature = tf.layers.dense({ units: 256, activation: 'linear', name: 'feature_output' }).apply(x) as tf.SymbolicTensor;
-      const combined = tf.layers.concatenate({ name: 'feature_direction_concat' }).apply([feature, inputDirections]) as tf.SymbolicTensor;
+    const sigma = tf.layers.dense({ units: 1, activation: 'relu', name: 'sigma_output' }).apply(x) as tf.SymbolicTensor;
+    const feature = tf.layers.dense({ units: 256, activation: 'linear', name: 'feature_output' }).apply(x) as tf.SymbolicTensor;
+    const combined = tf.layers.concatenate({ name: 'feature_direction_concat' }).apply([feature, inputDirections]) as tf.SymbolicTensor;
 
-      let rgb = tf.layers.dense({ units: 128, activation: 'relu', name: 'direction_dense_0' }).apply(combined) as tf.SymbolicTensor;
-      rgb = tf.layers.dense({ units: 3, activation: 'sigmoid', name: 'rgb_output' }).apply(rgb) as tf.SymbolicTensor;
+    let rgb = tf.layers.dense({ units: 128, activation: 'relu', name: 'direction_dense_0' }).apply(combined) as tf.SymbolicTensor;
+    rgb = tf.layers.dense({ units: 3, activation: 'sigmoid', name: 'rgb_output' }).apply(rgb) as tf.SymbolicTensor;
 
-      this.model = tf.model({ inputs: [inputPoints, inputDirections], outputs: [rgb, sigma] });
-      this.optimizer = tf.train.adam(1e-4);
-      console.log('NeRF model initialized. Summary:');
-      this.model.summary();
-    });
+    this.model = tf.model({ inputs: [inputPoints, inputDirections], outputs: [rgb, sigma] });
+    this.optimizer = tf.train.adam(1e-4);
+
+    console.log('NeRF model initialized.');
   }
 
-  async predict(points: tf.Tensor, viewDirections: tf.Tensor): Promise<{ rgb: tf.Tensor; sigma: tf.Tensor }> {
+  predict(points: tf.Tensor, viewDirections: tf.Tensor): { rgb: tf.Tensor; sigma: tf.Tensor } {
     if (!this.model) {
       throw new Error('Model not initialized. Call initModel() first.');
     }
@@ -127,10 +125,10 @@ export class NeRFModelWorker {
     let lossValue: number = 0;
 
     tf.tidy(() => {
-      tf.util.assert(rayOrigins.shape.length === 2 && rayOrigins.shape[1] === 3, `Expected rayOrigins to be [N, 3], but got ${rayOrigins.shape}`);
-      tf.util.assert(rayDirections.shape.length === 2 && rayDirections.shape[1] === 3, `Expected rayDirections to be [N, 3], but got ${rayDirections.shape}`);
-      tf.util.assert(targetRgb.shape.length === 2 && targetRgb.shape[1] === 3, `Expected targetRgb to be [N, 3], but got ${targetRgb.shape}`);
-      tf.util.assert(rayOrigins.shape[0] === targetRgb.shape[0], 'Batch sizes of ray origins and target RGB must match.');
+      tf.util.assert(rayOrigins.shape.length === 2 && rayOrigins.shape[1] === 3, () => `Expected rayOrigins to be [N, 3], but got ${rayOrigins.shape}`);
+      tf.util.assert(rayDirections.shape.length === 2 && rayDirections.shape[1] === 3, () => `Expected rayDirections to be [N, 3], but got ${rayDirections.shape}`);
+      tf.util.assert(targetRgb.shape.length === 2 && targetRgb.shape[1] === 3, () => `Expected targetRgb to be [N, 3], but got ${targetRgb.shape}`);
+      tf.util.assert(rayOrigins.shape[0] === targetRgb.shape[0], () => 'Batch sizes of ray origins and target RGB must match.');
 
       const N_rays = rayOrigins.shape[0];
 
@@ -172,21 +170,31 @@ export class NeRFModelWorker {
     if (!this.model) {
       throw new Error('Model not initialized.');
     }
-    return tf.tidy(() => {
-      const modelArtifacts = tf.io.encodeWeights(this.model!.getWeights());
-      return Comlink.transfer(modelArtifacts, [modelArtifacts.weightData]);
-    });
+    const weights = this.model!.getWeights();
+    const weightNames: string[] = [];
+    for (const w of this.model!.weights) {
+      weightNames.push(w.name);
+    }
+
+    const namedTensors = weights.map((tensor, i) => ({
+      name: weightNames[i],
+      tensor: tensor
+    }));
+
+    const { data, specs } = await tf.io.encodeWeights(namedTensors);
+    const serializableWeights: SerializableWeights = {
+      weightData: data,
+      weightSpecs: specs
+    };
+    return Comlink.transfer(serializableWeights, [serializableWeights.weightData]);
   }
 
   async setWeights(weights: SerializableWeights): Promise<void> {
     if (!this.model) {
       throw new Error('Model not initialized.');
     }
-    tf.tidy(() => {
-      const tensors = tf.io.decodeWeights(weights.weightData, weights.weightSpecs);
-      this.model!.setWeights(tensors);
-      tensors.forEach(t => t.dispose());
-    });
+    const weightTensors = await tf.io.decodeWeights(weights.weightData, weights.weightSpecs as tf.io.WeightsManifestEntry[]);
+    this.model!.setWeights(Object.values(weightTensors));
   }
 
   private calculateChannelSSIM(x: tf.Tensor, y: tf.Tensor): number {
@@ -214,19 +222,13 @@ export class NeRFModelWorker {
       const numerVal = numerator.arraySync() as number;
 
       if (Math.abs(denomVal) < Number.EPSILON) {
-        return (Math.abs(mu_x.arraySync() - mu_y.arraySync()) < Number.EPSILON) ? 1.0 : 0.0;
+        return (Math.abs((mu_x.arraySync() as number) - (mu_y.arraySync() as number)) < Number.EPSILON) ? 1.0 : 0.0;
       }
 
       return numerVal / denomVal;
     });
   }
 
-  /**
-   * Calculates PSNR and SSIM on a validation set to evaluate model quality.
-   * This implementation calculates PSNR and a global per-channel SSIM.
-   * @param validationData An object containing predicted and ground truth RGB tensors. Expected: { predictedRgb: tf.Tensor<[N, 3]>, groundTruthRgb: tf.Tensor<[N, 3]> }
-   * @returns An object containing PSNR and SSIM values.
-   */
   async calculateMetrics(validationData: { predictedRgb: tf.Tensor; groundTruthRgb: tf.Tensor }): Promise<{ psnr: number; ssim: number }> {
     if (!this.model) {
       throw new Error('Model not initialized. Call initModel() first.');
@@ -235,9 +237,9 @@ export class NeRFModelWorker {
     return tf.tidy(() => {
       const { predictedRgb, groundTruthRgb } = validationData;
 
-      tf.util.assert(predictedRgb.shape.length === 2 && predictedRgb.shape[1] === 3, `Expected predictedRgb to be [N, 3], but got ${predictedRgb.shape}`);
-      tf.util.assert(groundTruthRgb.shape.length === 2 && groundTruthRgb.shape[1] === 3, `Expected groundTruthRgb to be [N, 3], but got ${groundTruthRgb.shape}`);
-      tf.util.assert(predictedRgb.shape.every((dim, i) => dim === groundTruthRgb.shape[i]), 'Predicted and ground truth RGB tensors must have the same shape.');
+      tf.util.assert(predictedRgb.shape.length === 2 && predictedRgb.shape[1] === 3, () => `Expected predictedRgb to be [N, 3], but got ${predictedRgb.shape}`);
+      tf.util.assert(groundTruthRgb.shape.length === 2 && groundTruthRgb.shape[1] === 3, () => `Expected groundTruthRgb to be [N, 3], but got ${groundTruthRgb.shape}`);
+      tf.util.assert(predictedRgb.shape.every((dim, i) => dim === groundTruthRgb.shape[i]), () => 'Predicted and ground truth RGB tensors must have the same shape.');
 
       const mse = tf.losses.meanSquaredError(groundTruthRgb, predictedRgb).mean().arraySync() as number;
 
@@ -268,21 +270,13 @@ export class NeRFModelWorker {
     return { ...this.lastTrainingMetrics };
   }
 
-  /**
-   * Generates a 3D voxel grid of (RGB, sigma) values by querying the NeRF model
-   * at specified grid points, returning the data as a transferable ArrayBuffer.
-   * @param gridMin Minimum coordinates of the bounding box [x, y, z].
-   * @param gridMax Maximum coordinates of the bounding box [x, y, z].
-   * @param resolution The number of voxels along each dimension (e.g., 64 for 64x64x64).
-   * @returns An object containing the voxel data as an ArrayBuffer, resolution, and bounds.
-   */
   async generateVoxelGrid(
     gridMin: number[],
     gridMax: number[],
     resolution: number
   ): Promise<{ voxelData: ArrayBuffer, resolution: number, gridMin: number[], gridMax: number[] }> {
     if (!this.model) {
-      throw new Error('Model not initialized. Call initModel() first.');
+      throw new Error('Model not initialized.');
     }
     if (gridMin.length !== 3 || gridMax.length !== 3) {
       throw new Error('gridMin and gridMax must be 3-element arrays.');
@@ -293,67 +287,35 @@ export class NeRFModelWorker {
 
     console.log(`Generating voxel grid with resolution ${resolution}x${resolution}x${resolution} from [${gridMin}] to [${gridMax}]...`);
 
-    return tf.tidy(async () => {
-      // Generate linearly spaced coordinates for each dimension
+    tf.engine().startScope();
+    try {
       const xCoords = tf.linspace(gridMin[0], gridMax[0], resolution);
       const yCoords = tf.linspace(gridMin[1], gridMax[1], resolution);
       const zCoords = tf.linspace(gridMin[2], gridMax[2], resolution);
 
-      // Create a 3D grid of points
-      const [gridX, gridY, gridZ] = tf.meshgrid(xCoords, yCoords, zCoords);
+      const [gridX, gridY, gridZ] = (tf.meshgrid as any)(xCoords, yCoords, zCoords);
       const gridPoints = tf.stack([gridX.flatten(), gridY.flatten(), gridZ.flatten()], 1);
-      // gridPoints shape: [resolution^3, 3]
-
-      // For voxel grid generation, view direction is often canonical (e.g., looking along +Z)
-      // as the grid represents scene properties independent of view.
+      
       const numPoints = resolution * resolution * resolution;
-      const dummyViewDirections = tf.fill([numPoints, 3], [0, 0, 1]); // Example: looking along +Z
+      const dummyViewDirections = tf.tile(tf.tensor2d([0, 0, 1], [1, 3]), [numPoints, 1]);
 
-      // Perform NeRF inference for all grid points
-      const { rgb, sigma } = await this.predict(gridPoints, dummyViewDirections);
+      const { rgb, sigma } = this.predict(gridPoints, dummyViewDirections);
 
-      // Combine RGB and Sigma into a single Float32Array (RGBA format)
-      // Each voxel will have [R, G, B, Sigma]
-      const combinedData = tf.concat([rgb, sigma], -1); // Shape: [numPoints, 4]
+      const combinedData = tf.concat([rgb, sigma], -1);
 
-      // Convert to Float32Array for transfer
-      const voxelDataArray = combinedData.arraySync() as number[][];
-      const flatVoxelData = new Float32Array(numPoints * 4);
-
-      for (let i = 0; i < numPoints; i++) {
-        flatVoxelData[i * 4 + 0] = voxelDataArray[i][0]; // R
-        flatVoxelData[i * 4 + 1] = voxelDataArray[i][1]; // G
-        flatVoxelData[i * 4 + 2] = voxelDataArray[i][2]; // B
-        flatVoxelData[i * 4 + 3] = voxelDataArray[i][3]; // Sigma (density)
-      }
-
-      // tf.tidy will dispose of xCoords, yCoords, zCoords, gridX, gridY, gridZ, gridPoints,
-      // dummyViewDirections, rgb, sigma, and combinedData automatically.
+      const voxelDataArray = await combinedData.data();
+      const flatVoxelData = new Float32Array(voxelDataArray);
 
       console.log('Voxel grid generation complete.');
       return Comlink.transfer(
         { voxelData: flatVoxelData.buffer, resolution, gridMin, gridMax },
         [flatVoxelData.buffer]
       );
-    });
+    } finally {
+      tf.engine().endScope();
+    }
   }
 
-  /**
-   * Centralizes the full NeRF rendering pipeline within the worker.
-   * Performs ray generation, point sampling, model inference, and volume rendering.
-   * @param H Image height for rendering.
-   * @param W Image width for rendering.
-   * @param focalX Focal length in x-direction.
-   * @param focalY Focal length in y-direction.
-   * @param centerX Principal point x-coordinate.
-   * @param centerY Principal point y-coordinate.
-   * @param c2w Camera-to-world transformation matrix (Float32Array, 4x4).
-   * @param N_samples Number of samples per ray.
-   * @param near Near bound for ray sampling.
-   * @param far Far bound for ray sampling.
-   * @param perturb If true, add uniform noise for stratified sampling.
-   * @returns An object containing the rendered image data as an ArrayBuffer, and its width/height.
-   */
   async renderNeRFImage(
     H: number, W: number,
     focalX: number, focalY: number,
@@ -363,76 +325,54 @@ export class NeRFModelWorker {
     near: number = NEAR_PLANE,
     far: number = FAR_PLANE,
     perturb: boolean = PERTURB_SAMPLES
-  ): Promise<Comlink.Transfer<RenderedImageData>> {
+  ): Promise<RenderedImageData> {
     if (!this.model) {
       throw new Error('Model not initialized. Call initModel() first.');
     }
 
     try {
-      return await tf.tidy(async () => {
-        // 1. Generate rays for the render resolution
-        const rays = nerfDataUtils.getRays(
-          H, W,
-          focalX, focalY,
-          centerX, centerY,
-          c2w // Pass c2w directly
-        );
-        const rayOrigins = rays.rayOrigins;
-        const rayDirections = rays.rayDirections;
+      tf.engine().startScope();
+      const rays = nerfDataUtils.getRays(
+        H, W,
+        focalX, focalY,
+        centerX, centerY,
+        c2w
+      );
+      const sampled = nerfDataUtils.samplePointsAlongRays(
+        rays.rayOrigins, rays.rayDirections, near, far, N_samples, perturb
+      );
+      const viewDirectionsForSamples = tf.tile(rays.rayDirections.expandDims(1), [1, N_samples, 1])
+        .reshape([-1, 3]);
+      const predictions = this.predict(
+        sampled.sampledPoints, viewDirectionsForSamples
+      );
+      const N_rays = rays.rayOrigins.shape[0];
+      const predictedRgbReshaped = predictions.rgb.reshape([N_rays, N_samples, 3]);
+      const predictedSigmaReshaped = predictions.sigma.reshape([N_rays, N_samples, 1]);
+      const volumeRendered = nerfDataUtils.volumeRender(
+        predictedRgbReshaped, predictedSigmaReshaped, sampled.depthValues
+      );
+      const renderedRgb = volumeRendered.renderedRgb;
 
-        // 2. Sample points along rays
-        const sampled = nerfDataUtils.samplePointsAlongRays(
-          rayOrigins, rayDirections, near, far, N_samples, perturb
-        );
-        const sampledPoints = sampled.sampledPoints;
-        const depthValues = sampled.depthValues;
+      const imageData = await renderedRgb.mul(255).cast('int32').data();
+      const pixelArray = new Uint8Array(W * H * 4);
+      for (let i = 0; i < imageData.length; i++) {
+        const [r, g, b] = (imageData as any)[i];
+        pixelArray[i * 4 + 0] = r;
+        pixelArray[i * 4 + 1] = g;
+        pixelArray[i * 4 + 2] = b;
+        pixelArray[i * 4 + 3] = 255; // Alpha
+      }
 
-        // Prepare view directions for each sampled point
-        // Each sampled point along a ray shares the same view direction as the ray itself.
-        const viewDirectionsForSamples = tf.tile(rayDirections.expandDims(1), [1, N_samples, 1])
-          .reshape([-1, 3]);
-
-        // 3. Perform NeRF inference
-        const predictions = await this.predict(
-          sampledPoints, viewDirectionsForSamples
-        );
-        const predictedRgbSamples = predictions.rgb;
-        const predictedSigmaSamples = predictions.sigma;
-
-        // Reshape predictions back to [N_rays, N_samples, ...] for volume rendering
-        const N_rays = rayOrigins.shape[0];
-        const predictedRgbReshaped = predictedRgbSamples.reshape([N_rays, N_samples, 3]);
-        const predictedSigmaReshaped = predictedSigmaSamples.reshape([N_rays, N_samples, 1]);
-
-        // 4. Perform Volume Rendering
-        const volumeRendered = nerfDataUtils.volumeRender(
-          predictedRgbReshaped, predictedSigmaReshaped, depthValues
-        );
-        const renderedRgb = volumeRendered.renderedRgb;
-
-        // Convert rendered RGB to Uint8Array (RGBA) for display
-        const imageData = renderedRgb.mul(255).cast('int32').arraySync() as number[][];
-        const pixelArray = new Uint8Array(W * H * 4);
-        for (let i = 0; i < imageData.length; i++) {
-          const [r, g, b] = imageData[i];
-          pixelArray[i * 4 + 0] = r;
-          pixelArray[i * 4 + 1] = g;
-          pixelArray[i * 4 + 2] = b;
-          pixelArray[i * 4 + 3] = 255; // Alpha
-        }
-
-        // Comlink.transfer the ArrayBuffer back to the main thread
-        return Comlink.transfer(
-          { imageData: pixelArray.buffer, width: W, height: H },
-          [pixelArray.buffer]
-        );
-      });
+      return Comlink.transfer(
+        { imageData: pixelArray.buffer, width: W, height: H },
+        [pixelArray.buffer]
+      );
     } catch (error) {
       console.error('Error during centralized NeRF rendering:', error);
       throw error;
     } finally {
-      // tf.tidy() automatically disposes of all tensors created within its scope.
-      // No explicit disposal is needed here.
+      tf.engine().endScope();
     }
   }
 }

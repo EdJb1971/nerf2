@@ -122,12 +122,10 @@ export class NeRFDatabaseService {
     const latestCheckpoints = await db.modelCheckpoints
       .where('modelVersion')
       .equals(maxModelVersion)
-      .orderBy('timestamp')
-      .reverse()
-      .limit(1)
       .toArray();
 
     if (latestCheckpoints.length > 0) {
+      latestCheckpoints.sort((a, b) => b.timestamp - a.timestamp);
       return latestCheckpoints[0];
     }
 

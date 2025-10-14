@@ -286,9 +286,9 @@ function App() {
         const id = `nerf-peer-${Math.random().toString(36).substring(2, 9)}`;
         setPeerId(id);
         await federatedTrainerWorkerProxy.startSession(id, federationSecret, {
-          host: process.env.PEERJS_HOST || 'localhost',
-          port: parseInt(process.env.PEERJS_PORT || '9000', 10),
-          path: process.env.PEERJS_PATH || '/myapp'
+          host: import.meta.env.VITE_PEERJS_HOST || 'localhost',
+          port: parseInt(import.meta.env.VITE_PEERJS_PORT || '9000', 10),
+          path: import.meta.env.VITE_PEERJS_PATH || '/myapp'
         });
         await federatedTrainerWorkerProxy.startAggregationTimer();
         setIsFederatedSessionActive(true);
@@ -342,54 +342,53 @@ function App() {
         const poseRecord = posesByImageId.get(imageRecord.id)!;
 
         try {
-          await tf.tidy(async () => {
-            const imgBlob = imageRecord.data;
-            const imgBitmap = await createImageBitmap(imgBlob);
+          tf.engine().startScope();
+          const imgBlob = imageRecord.data;
+          const imgBitmap = await createImageBitmap(imgBlob);
 
-            const H = TRAINING_IMAGE_RESOLUTION;
-            const W = TRAINING_IMAGE_RESOLUTION;
-            const focalX = W;
-            const focalY = H;
-            const centerX = W / 2;
-            const centerY = H / 2;
+          const H = TRAINING_IMAGE_RESOLUTION;
+          const W = TRAINING_IMAGE_RESOLUTION;
+          const focalX = W;
+          const focalY = H;
+          const centerX = W / 2;
+          const centerY = H / 2;
 
-            const imageTensor = tf.browser.fromPixels(imgBitmap).resizeBilinear([H, W]).div(255.0);
-            imgBitmap.close();
+          const imageTensor = tf.browser.fromPixels(imgBitmap).resizeBilinear([H, W]).div(255.0);
+          imgBitmap.close();
 
-            const rays = nerfDataUtils.getRays(
-              H, W, focalX, focalY, centerX, centerY, poseRecord.poseMatrix
-            );
-            const allRayOrigins = rays.rayOrigins;
-            const allRayDirections = rays.rayDirections;
-            const allTargetRgb = imageTensor.reshape([-1, 3]);
+          const rays = nerfDataUtils.getRays(
+            H, W, focalX, focalY, centerX, centerY, poseRecord.poseMatrix
+          );
+          const allRayOrigins = rays.rayOrigins;
+          const allRayDirections = rays.rayDirections;
+          const allTargetRgb = imageTensor.reshape([-1, 3]);
 
-            const numPixels = H * W;
-            const indices = tf.randomUniform([TRAINING_BATCH_SIZE], 0, numPixels, 'int32');
+          const numPixels = H * W;
+          const indices = tf.randomUniform([TRAINING_BATCH_SIZE], 0, numPixels, 'int32');
 
-            const sampledRayOrigins = tf.gather(allRayOrigins, indices);
-            const sampledRayDirections = tf.gather(allRayDirections, indices);
-            const sampledTargetRgb = tf.gather(allTargetRgb, indices);
+          const sampledRayOrigins = tf.gather(allRayOrigins, indices);
+          const sampledRayDirections = tf.gather(allRayDirections, indices);
+          const sampledTargetRgb = tf.gather(allTargetRgb, indices);
 
-            const loss = await nerfModelWorkerProxy.train(
-              Comlink.transfer(sampledRayOrigins, [sampledRayOrigins.dataBuffer]),
-              Comlink.transfer(sampledRayDirections, [sampledRayDirections.dataBuffer]),
-              Comlink.transfer(sampledTargetRgb, [sampledTargetRgb.dataBuffer])
-            );
+          const loss = await nerfModelWorkerProxy.train(
+            Comlink.transfer(sampledRayOrigins, [(await sampledRayOrigins.data()).buffer]),
+            Comlink.transfer(sampledRayDirections, [(await sampledRayDirections.data()).buffer]),
+            Comlink.transfer(sampledTargetRgb, [(await sampledTargetRgb.data()).buffer])
+          );
 
-            const currentMetrics = await nerfModelWorkerProxy.getTrainingMetrics();
-            setLocalTrainingEpoch(currentMetrics.epoch);
-            console.log(`Training Iteration ${iter + 1}/${totalTrainingIterations}. Image: ${imageRecord.filename}, Epoch: ${currentMetrics.epoch}, Loss: ${loss.toFixed(6)}`);
+          const currentMetrics = await nerfModelWorkerProxy.getTrainingMetrics();
+          setLocalTrainingEpoch(currentMetrics.epoch);
+          console.log(`Training Iteration ${iter + 1}/${totalTrainingIterations}. Image: ${imageRecord.filename}, Epoch: ${currentMetrics.epoch}, Loss: ${loss.toFixed(6)}`);
 
-            const iterationCount = await federatedTrainerWorkerProxy.incrementLocalTrainingIteration();
-            const schedule = await federatedTrainerWorkerProxy.getCommunicationSchedule();
+          const iterationCount = await federatedTrainerWorkerProxy.incrementLocalTrainingIteration();
+          const schedule = await federatedTrainerWorkerProxy.getCommunicationSchedule();
 
-            if (iterationCount % schedule.iterationsPerRound === 0) {
-              console.log(`Iterations per round (${schedule.iterationsPerRound}) met. Sending weights to peers.`);
-              await federatedTrainerWorkerProxy.sendWeightsToPeers();
-            }
-          });
+          if (iterationCount % schedule.iterationsPerRound === 0) {
+            console.log(`Iterations per round (${schedule.iterationsPerRound}) met. Sending weights to peers.`);
+            await federatedTrainerWorkerProxy.sendWeightsToPeers();
+          }
         } finally {
-            // Tensors are disposed by the tf.tidy block
+            tf.engine().endScope();
         }
       }
 

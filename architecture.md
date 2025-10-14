@@ -21,10 +21,14 @@ The system is composed of three main layers:
 
 ### 3.1. Frontend (UI Layer)
 
--   **`App.tsx`**: The root React component. It serves as the main application controller, initializing workers, managing application state (images, poses, federated session), and handling user events.
+-   **`App.tsx`**: The root React component. It serves as the main application controller, initializing workers, managing application state, and handling user events. It now includes:
+    -   An automated pose estimation workflow that can be triggered by the user to run a sequential SfM pipeline on all uploaded images.
+    -   A progress indicator for the pose estimation process.
+    -   Camera intrinsics estimation using EXIF data from images (with a fallback to a heuristic), removing previous hardcoded values.
+    -   A corrected NeRF training loop that uses random sampling of images at each iteration, which is a more effective training strategy.
 -   **`components/NeRFRenderer.tsx`**: A Three.js-based component (using `@react-three/fiber`) for rendering the NeRF scene. It supports two rendering modes:
     1.  **Progressive Ray Marching**: Communicates with the `NeRFModelWorker` to render the scene. It requests low-resolution renders during camera movement and a high-resolution render when idle.
-    2.  **Voxel Grid Rendering**: Uses a pre-computed 3D voxel grid and a custom GLSL shader to render the scene on the GPU, which is significantly faster.
+    2.  **Voxel Grid Rendering**: Uses a pre-computed 3D voxel grid and a custom GLSL shader to render the scene on the GPU. The bounding box for this grid is now adaptively calculated based on the estimated camera poses, instead of being hardcoded.
 -   **`components/PhotoGallery.tsx`**: Displays a gallery of user-contributed images stored in the local database.
 -   **Image Ingestion**: The UI allows users to add images via file upload, drag-and-drop, camera capture, and pasting from the clipboard.
 
@@ -47,7 +51,7 @@ The use of Web Workers is a cornerstone of this architecture, preventing the bro
         -   Estimates relative camera poses between image pairs using Structure from Motion (SfM) techniques (ORB features, feature matching, and Essential Matrix estimation).
         -   Integrates `DeviceOrientationEvent` data for initial pose estimates.
         -   Includes a `validateBatchPhotos` method to assess image quality (brightness, sharpness, and redundancy).
-        -   Contains a placeholder for global pose refinement (`refineGlobalPoses`).
+        -   Contains a placeholder for global pose refinement (`refineGlobalPoses`). A warning has been added to the console to inform developers of its limitations.
 
 -   **`workers/FederatedTrainerWorker.ts`**:
     -   **Technology**: PeerJS for WebRTC, `msgpack` for serialization.
@@ -73,11 +77,17 @@ The use of Web Workers is a cornerstone of this architecture, preventing the bro
 ### 4.1. Training Data Flow
 
 1.  **Image Upload**: User uploads images, which are stored in IndexedDB via `NeRFDatabaseService`.
-2.  **Pose Estimation**: The `PoseEstimationWorker` is used to calculate camera poses for the images. *This part of the workflow seems incomplete in the UI.*
-3.  **Training Initiation**: The user starts the training process from the UI.
-4.  **Data Preparation**: `App.tsx` retrieves images and poses, generates rays, and sends them to the `NeRFModelWorker`.
-5.  **Local Training**: `NeRFModelWorker` performs a training step and updates its local model.
-6.  **Federated Sync**:
+2.  **Pose Estimation**: The user can now trigger an automated pose estimation pipeline from the UI. This process:
+    -   Estimates camera intrinsics from EXIF data.
+    -   Runs a sequential SfM process on all images to calculate their camera poses.
+    -   Saves the poses to the database.
+3.  **Training Initiation**: The user starts the training process from the UI, which now runs for a configurable number of iterations.
+4.  **Data Preparation & Local Training**: For each training iteration, `App.tsx`:
+    -   Randomly selects an image and its corresponding pose.
+    -   Generates a batch of rays from that image.
+    -   Sends the rays to the `NeRFModelWorker` to perform a single training step.
+    This random sampling approach is more effective for learning a consistent 3D scene.
+5.  **Federated Sync**:
     -   After a few local iterations, `FederatedTrainerWorker` requests the model weights from `NeRFModelWorker`.
     -   It calculates the delta, adds noise, and sends it to connected peers.
     -   It receives deltas from other peers and, on a set interval, aggregates them.
@@ -92,11 +102,7 @@ The use of Web Workers is a cornerstone of this architecture, preventing the bro
 
 ## 5. Placeholders, Mock Code, and Incomplete Functionality
 
--   **Automated Pose Estimation Pipeline**: While the `PoseEstimationWorker` has the necessary functions, there is no UI flow to automatically run a full Structure from Motion (SfM) pipeline on a set of uploaded images to generate the required camera poses for training.
--   **Global Pose Refinement**: The `refineGlobalPoses` method in `PoseEstimationWorker` is a placeholder and does not implement a robust algorithm like Bundle Adjustment.
--   **Hardcoded Parameters**: Several important parameters are hardcoded:
-    -   Camera intrinsics (focal length) in `App.tsx`.
-    -   The bounding box for the voxel grid in `NeRFRenderer.tsx`.
+-   **Global Pose Refinement**: The `refineGlobalPoses` method in `PoseEstimationWorker` is a placeholder that performs a simple iterative smoothing. It is not a full Bundle Adjustment implementation. A warning has been added to the console to highlight this limitation.
 -   **`opencv.js.patch`**: The presence of this patch file indicates a potential workaround for an issue with the `opencv.js` library, which might be brittle.
--   **Error Handling and User Feedback**: The application could benefit from more comprehensive error handling and clearer feedback to the user, especially for complex, long-running background tasks.
+-   **Error Handling and User Feedback**: While a progress indicator has been added for pose estimation, the application could still benefit from more comprehensive error handling and user feedback for other long-running tasks.
 -   **Federation Security**: The federated learning sessions are secured only by a shared secret string. This is a basic implementation and would need to be enhanced for a production environment.

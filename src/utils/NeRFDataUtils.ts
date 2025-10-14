@@ -171,7 +171,7 @@ export class NeRFDataUtils {
   ): { renderedRgb: tf.Tensor, renderedDepth: tf.Tensor, weights: tf.Tensor } {
     return tf.tidy(() => {
       const N_rays = rgb.shape[0];
-      const N_samples = rgb.shape[1];
+      const N_samples = rgb.shape[1] as number;
 
       // Calculate delta (distance between adjacent samples)
       // delta_i = t_{i+1} - t_i

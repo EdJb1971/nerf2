@@ -33,7 +33,7 @@ export class CoordinateTransformer {
     // y = gamma (rotation around Y)
     // z = alpha (rotation around Z)
     // Order is 'ZXY'
-    quat.fromEuler(q_device_orientation, betaRad, gammaRad, alphaRad, 'ZXY');
+    quat.fromEuler(q_device_orientation, betaRad, gammaRad, alphaRad, 'zxy');
 
     // q_device_orientation represents the rotation from Earth frame to Device frame.
     // This is R_earth_to_device.

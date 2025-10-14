@@ -2,12 +2,11 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { Canvas, useFrame, useThree, extend } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
+import { DataTexture3D } from 'three';
 import * as Comlink from 'comlink';
-import * as tf from '@tensorflow/tfjs';
 import { mat4 } from 'gl-matrix';
 
 import { NeRFModelWorker } from '../workers/NeRFModelWorker';
-import { nerfDataUtils } from '../utils/NeRFDataUtils';
 import { CameraPoseRecord } from '../services/NeRFDatabaseService';
 
 type NeRFModelWorkerProxy = Comlink.Remote<NeRFModelWorker>;
@@ -30,11 +29,6 @@ const LOW_RES_WIDTH = 64;
 const LOW_RES_HEIGHT = 64;
 const HIGH_RES_WIDTH = 256;
 const HIGH_RES_HEIGHT = 256;
-
-const N_SAMPLES = 64;
-const NEAR_PLANE = 0.0;
-const FAR_PLANE = 1.0;
-const PERTURB_SAMPLES = true;
 
 // Extend THREE with ShaderMaterial for use in JSX
 extend({ ShaderMaterial: THREE.ShaderMaterial });
@@ -186,7 +180,7 @@ function VoxelGridVisualizer({
   gridMax,
   maxSteps,
 }: {
-  voxelGridTexture: THREE.DataTexture3D;
+  voxelGridTexture: any;
   gridMin: THREE.Vector3;
   gridMax: THREE.Vector3;
   maxSteps: number;
@@ -240,7 +234,7 @@ const calculateSceneBounds = (poses: CameraPoseRecord[]): {
   }
   
   const positions = poses.map(pose => {
-    const matrix = new THREE.Matrix4().fromArray(pose.poseMatrix);
+    const matrix = new THREE.Matrix4().fromArray(Array.from(pose.poseMatrix));
     const position = new THREE.Vector3();
     matrix.decompose(position, new THREE.Quaternion(), new THREE.Vector3());
     return position;
@@ -291,15 +285,15 @@ export const NeRFRenderer: React.FC<NeRFRendererProps> = ({
   ));
   nerfTexture.needsUpdate = true;
 
-  const [voxelGridTexture, setVoxelGridTexture] = useState<THREE.DataTexture3D | null>(null);
+  const [voxelGridTexture, setVoxelGridTexture] = useState<any | null>(null);
   const [voxelGridBounds, setVoxelGridBounds] = useState<{ min: THREE.Vector3, max: THREE.Vector3 } | null>(null);
 
   const lastCameraPosition = useRef(new THREE.Vector3());
   const lastCameraQuaternion = useRef(new THREE.Quaternion());
   const renderTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const scaleImageData = useCallback((lowResData: Uint8Array, lowResW: number, lowResH: number, highResW: number, highResH: number): Uint8Array => {
-    const highResData = new Uint8Array(highResW * highResH * 4);
+  const scaleImageData = useCallback((lowResData: Uint8Array, lowResW: number, lowResH: number, highResW: number, highResH: number): Uint8ClampedArray => {
+    const highResData = new Uint8ClampedArray(highResW * highResH * 4);
     const x_ratio = lowResW / highResW;
     const y_ratio = lowResH / highResH;
 
@@ -330,22 +324,23 @@ export const NeRFRenderer: React.FC<NeRFRendererProps> = ({
     try {
       const c2w = mat4.create();
       camera.updateMatrixWorld();
-      mat4.copy(c2w, camera.matrixWorld.elements as Float32Array);
+      mat4.copy(c2w, camera.matrixWorld.elements);
 
       // Call the centralized rendering pipeline in the worker
       const { imageData, width: renderedWidth, height: renderedHeight } = await nerfModelWorkerProxy.renderNeRFImage(
         renderHeight, renderWidth,
         focalX, focalY,
         centerX, centerY,
-        c2w // Pass camera matrix
+        new Float32Array(c2w) // Pass camera matrix
       );
 
-      const pixelArray = new Uint8Array(imageData);
+      const pixelArray = new Uint8ClampedArray(new Uint8Array(imageData));
 
       if (renderedWidth < HIGH_RES_WIDTH || renderedHeight < HIGH_RES_HEIGHT) {
-        nerfTexture.image.data = scaleImageData(pixelArray, renderedWidth, renderedHeight, HIGH_RES_WIDTH, HIGH_RES_HEIGHT);
+        const scaledData = scaleImageData(new Uint8Array(pixelArray), renderedWidth, renderedHeight, HIGH_RES_WIDTH, HIGH_RES_HEIGHT);
+        nerfTexture.image = new ImageData(new Uint8ClampedArray(scaledData), HIGH_RES_WIDTH, HIGH_RES_HEIGHT);
       } else {
-        nerfTexture.image.data = pixelArray;
+        nerfTexture.image = new ImageData(pixelArray, renderedWidth, renderedHeight);
       }
       nerfTexture.needsUpdate = true;
 
@@ -371,14 +366,14 @@ export const NeRFRenderer: React.FC<NeRFRendererProps> = ({
         );
 
         // Create THREE.DataTexture3D
-        const texture = new THREE.DataTexture3D(
+        const texture = new DataTexture3D(
           new Float32Array(voxelData), // Use Float32Array for high precision
           resolution,
           resolution,
           resolution
         );
-        texture.format = THREE.RGBAFormat; // Assuming RGBA (RGB + Sigma)
-        texture.type = THREE.FloatType; // Data is Float32Array
+        texture.format = THREE.RGBAFormat;
+        texture.type = THREE.FloatType;
         texture.minFilter = THREE.LinearFilter;
         texture.magFilter = THREE.LinearFilter;
         texture.needsUpdate = true;

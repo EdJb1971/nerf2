@@ -2,23 +2,26 @@ import * as Comlink from 'comlink';
 import { Peer, DataConnection } from 'peerjs';
 import * as msgpack from '@msgpack/msgpack';
 import * as tf from '@tensorflow/tfjs';
-import { nerfDatabaseService, ModelCheckpointRecord, SerializableWeights } from '../services/NeRFDatabaseService';
-import { NeRFModelWorker } from './NeRFModelWorker';
+import { nerfDatabaseService } from '../services/NeRFDatabaseService';
+import { NeRFModelWorker, SerializableWeights } from './NeRFModelWorker';
 
 // Helper to convert serializable weights to tf.Tensor[]
-function serializableWeightsToTensors(serializable: SerializableWeights): tf.Tensor[] {
-  return tf.tidy(() => tf.io.decodeWeights(serializable.weightData, serializable.weightSpecs));
+async function serializableWeightsToTensors(serializable: SerializableWeights): Promise<tf.Tensor[]> {
+  const a = await tf.io.decodeWeights(serializable.weightData, serializable.weightSpecs as tf.io.WeightsManifestEntry[]);
+  return Object.values(a);
 }
 
 // Helper to convert tf.Tensor[] to serializable weights
-function tensorsToSerializableWeights(tensors: tf.Tensor[]): SerializableWeights {
-  return tf.tidy(() => {
-    const modelArtifacts = tf.io.encodeWeights(tensors);
+async function tensorsToSerializableWeights(tensors: tf.Tensor[]): Promise<SerializableWeights> {
+    const namedTensors = tensors.map((tensor, i) => ({
+        name: `weight${i}`,
+        tensor: tensor,
+    }));
+    const modelArtifacts = await tf.io.encodeWeights(namedTensors);
     return {
-      weightData: modelArtifacts.weightData,
-      weightSpecs: modelArtifacts.weightSpecs
+      weightData: modelArtifacts.data,
+      weightSpecs: modelArtifacts.specs,
     };
-  });
 }
 
 interface FederatedSchedule {
@@ -48,7 +51,6 @@ export class FederatedTrainerWorker {
 
   private aggregationTimer: NodeJS.Timeout | null = null;
   private localTrainingIterationCount: number = 0;
-  private lastSentWeightsIteration: number = 0;
 
   // New: Store the last aggregated global model weights
   private lastAggregatedWeights: SerializableWeights | null = null;
@@ -62,13 +64,6 @@ export class FederatedTrainerWorker {
     this.nerfDatabaseService = dbService;
   }
 
-  /**
-   * Initializes the Comlink proxy for the NeRFModelWorker.
-   * This must be called from the main thread after creating both workers.
-   * Also attempts to load the latest model checkpoint to initialize lastAggregatedWeights,
-   * or uses the freshly initialized model's weights as the first global model.
-   * @param worker A Comlink remote proxy to the NeRFModelWorker instance.
-   */
   async initNeRFModelWorker(worker: Comlink.Remote<NeRFModelWorker>): Promise<void> {
     this.nerfModelWorker = worker;
     console.log('FederatedTrainerWorker: NeRFModelWorker proxy initialized.');
@@ -79,28 +74,18 @@ export class FederatedTrainerWorker {
         this.lastAggregatedWeights = latestCheckpoint.weights;
         console.log('FederatedTrainerWorker: Initialized lastAggregatedWeights from database checkpoint.');
       } else {
-        // If no checkpoint, use the freshly initialized model's weights as the first global model
         const initialModelWeights = await this.nerfModelWorker.getWeights();
         this.lastAggregatedWeights = initialModelWeights;
         console.log('FederatedTrainerWorker: Initialized lastAggregatedWeights from fresh NeRF model.');
       }
     } catch (error) {
       console.error('Error loading or initializing lastAggregatedWeights for FederatedTrainerWorker:', error);
-      // Fallback: if all else fails, ensure it's not null to prevent later errors,
-      // though this might lead to sending full weights as deltas from zeros initially.
       if (!this.lastAggregatedWeights && this.nerfModelWorker) {
         this.lastAggregatedWeights = await this.nerfModelWorker.getWeights();
       }
     }
   }
 
-  /**
-   * Starts a PeerJS session. The sharedSecret must be provided by the caller for secure communication.
-   * @param peerId The ID for this peer.
-   * @param sharedSecret A pre-shared secret for authenticating connections. Must be securely distributed out-of-band.
-   * @param peerServerConfig Optional PeerJS server configuration.
-   * @returns The Peer ID once the session is open.
-   */
   async startSession(peerId: string, sharedSecret: string, peerServerConfig?: { host: string; port: number; path: string }): Promise<string> {
     if (this.peer && this.peer.open) {
       console.warn('PeerJS session already active. Disconnecting old session.');
@@ -110,7 +95,7 @@ export class FederatedTrainerWorker {
     }
 
     this.currentPeerId = peerId;
-    this.sharedSecret = sharedSecret; // SEC-FTW-001: sharedSecret must be provided by the caller
+    this.sharedSecret = sharedSecret;
     this.peer = new Peer(peerId, peerServerConfig);
 
     return new Promise((resolve, reject) => {
@@ -155,7 +140,6 @@ export class FederatedTrainerWorker {
     this.connections.set(conn.peer, conn);
 
     conn.on('data', (data) => {
-      // Expecting data to be an object with metadata (serialized weightSpecs) and weightData (ArrayBuffer)
       if (typeof data === 'object' && data !== null && 'metadata' in data && 'weightData' in data && data.weightData instanceof ArrayBuffer) {
         console.log(`Received weights from peer: ${conn.peer}`);
         this.receiveWeightsFromPeer(conn.peer, data as { metadata: ArrayBuffer; weightData: ArrayBuffer });
@@ -202,12 +186,6 @@ export class FederatedTrainerWorker {
     this.setupConnectionListeners(conn);
   }
 
-  /**
-   * Sends the local model's *delta weights* (difference from the last aggregated model) to connected peers,
-   * applying differential privacy and using efficient serialization.
-   * If no last aggregated model exists (should be initialized by initNeRFModelWorker),
-   * the delta is calculated against a zero model, effectively sending full weights.
-   */
   async sendWeightsToPeers(): Promise<void> {
     if (!this.nerfModelWorker) {
       throw new Error('NeRFModelWorker proxy not initialized.');
@@ -217,31 +195,27 @@ export class FederatedTrainerWorker {
       return;
     }
     if (!this.lastAggregatedWeights) {
-      // This case should ideally be handled by initNeRFModelWorker, but as a safeguard:
       console.error('lastAggregatedWeights is not initialized. Cannot calculate delta. Aborting send.');
       return;
     }
 
     console.log('Calculating delta weights, applying differential privacy, and sending to peers...');
 
-    await tf.tidy(async () => {
-      const currentLocalWeights: SerializableWeights = await this.nerfModelWorker!.getWeights();
-      const currentLocalTensors = serializableWeightsToTensors(currentLocalWeights);
-      const lastAggregatedTensors = serializableWeightsToTensors(this.lastAggregatedWeights!); // lastAggregatedWeights is guaranteed not null here
+    tf.engine().startScope();
+    try {
+      const currentLocalWeights = await this.nerfModelWorker!.getWeights();
+      const currentLocalTensors = await serializableWeightsToTensors(currentLocalWeights);
+      const lastAggregatedTensors = await serializableWeightsToTensors(this.lastAggregatedWeights!);
 
-      // Ensure shapes match before subtraction
       if (currentLocalTensors.length !== lastAggregatedTensors.length ||
           !currentLocalTensors.every((t, i) => tf.util.arraysEqual(t.shape, lastAggregatedTensors[i].shape))) {
         console.error('Shape mismatch between current local weights and last aggregated weights. Cannot calculate delta. Aborting send.');
-        currentLocalTensors.forEach(t => t.dispose());
-        lastAggregatedTensors.forEach(t => t.dispose());
-        return; // Abort sending
+        return;
       }
 
-      // Calculate delta weights: currentLocalWeights - lastAggregatedWeights
       const deltaTensors = currentLocalTensors.map((localT, i) => localT.sub(lastAggregatedTensors[i]));
       const privatizedDeltaTensors = this.addDifferentialPrivacy(deltaTensors, this.noiseMultiplier, this.clipNorm);
-      const privatizedSerializableDelta = tensorsToSerializableWeights(privatizedDeltaTensors);
+      const privatizedSerializableDelta = await tensorsToSerializableWeights(privatizedDeltaTensors);
 
       const payload = {
         weightSpecs: privatizedSerializableDelta.weightSpecs
@@ -257,13 +231,9 @@ export class FederatedTrainerWorker {
           console.log(`Sent delta weights to peer: ${conn.peer}`);
         }
       }
-
-      currentLocalTensors.forEach(t => t.dispose());
-      lastAggregatedTensors.forEach(t => t.dispose());
-      deltaTensors.forEach(t => t.dispose());
-      privatizedDeltaTensors.forEach(t => t.dispose());
-    });
-    this.lastSentWeightsIteration = this.localTrainingIterationCount;
+    } finally {
+      tf.engine().endScope();
+    }
   }
 
   private addDifferentialPrivacy(weights: tf.Tensor[], noiseMultiplier: number, clipNorm: number): tf.Tensor[] {
@@ -277,22 +247,19 @@ export class FederatedTrainerWorker {
   }
 
   async receiveWeightsFromPeer(peerId: string, data: { metadata: ArrayBuffer; weightData: ArrayBuffer }): Promise<void> {
-    let localTensorsForShapeCheck: tf.Tensor[] | null = null;
     try {
-      const decodedPayload = msgpack.decode(data.metadata) as { weightSpecs: tf.io.WeightGroup[] };
+      const decodedPayload = msgpack.decode(data.metadata) as { weightSpecs: tf.io.WeightsManifestEntry[] };
       const receivedSerializableWeights: SerializableWeights = {
         weightData: data.weightData,
         weightSpecs: decodedPayload.weightSpecs
       };
-      const decodedTensors = serializableWeightsToTensors(receivedSerializableWeights);
+      const decodedTensors = await serializableWeightsToTensors(receivedSerializableWeights);
 
       if (!this.nerfModelWorker) {
         throw new Error('NeRFModelWorker proxy not initialized for Byzantine detection.');
       }
-      // For Byzantine detection, we need the shapes of the *full* model weights,
-      // as deltas should have the same shape as the full weights.
       const localSerializableWeights = await this.nerfModelWorker!.getWeights();
-      localTensorsForShapeCheck = serializableWeightsToTensors(localSerializableWeights);
+      const localTensorsForShapeCheck = await serializableWeightsToTensors(localSerializableWeights);
       const expectedShapes = localTensorsForShapeCheck.map(t => t.shape);
 
       if (this.byzantineDetection(decodedTensors, expectedShapes)) {
@@ -300,14 +267,11 @@ export class FederatedTrainerWorker {
         console.log(`Delta weights from ${peerId} buffered for aggregation.`);
       } else {
         console.warn(`Byzantine detection failed for delta weights from ${peerId}. Discarding.`);
-        decodedTensors.forEach(t => t.dispose());
       }
+      tf.dispose(decodedTensors);
+      tf.dispose(localTensorsForShapeCheck);
     } catch (error) {
       console.error(`Error decoding or processing delta weights from ${peerId}:`, error);
-    } finally {
-      if (localTensorsForShapeCheck) {
-        localTensorsForShapeCheck.forEach(t => t.dispose());
-      }
     }
   }
 
@@ -351,10 +315,6 @@ export class FederatedTrainerWorker {
     return this.localTrainingIterationCount;
   }
 
-  /**
-   * CQ-FTW-001: Allows the main thread to dynamically set communication schedule parameters.
-   * @param schedule The new federated communication schedule.
-   */
   async setCommunicationSchedule(schedule: FederatedSchedule): Promise<void> {
     this.iterationsPerRound = schedule.iterationsPerRound;
     this.aggregationIntervalMs = schedule.aggregationIntervalMs;
@@ -368,7 +328,6 @@ export class FederatedTrainerWorker {
       this.stopAggregationTimer();
     }
 
-    // Use the dynamically set aggregation interval
     console.log(`Starting aggregation timer with interval: ${this.aggregationIntervalMs}ms`);
 
     this.aggregationTimer = setInterval(async () => {
@@ -389,10 +348,6 @@ export class FederatedTrainerWorker {
     }
   }
 
-  /**
-   * Performs federated averaging on received *delta weights* and applies the aggregated deltas
-   * to the current global model. Also saves the aggregated model as a checkpoint.
-   */
   async aggregateWeights(): Promise<void> {
     if (!this.nerfModelWorker) {
       throw new Error('NeRFModelWorker proxy not initialized.');
@@ -401,7 +356,6 @@ export class FederatedTrainerWorker {
       throw new Error('lastAggregatedWeights is not initialized. Cannot perform delta aggregation.');
     }
 
-    // Use the dynamically set minPeersForAggregation
     if (this.receivedWeightsBuffer.size < this.minPeersForAggregation) {
       console.warn(`Not enough peer delta weights (${this.receivedWeightsBuffer.size}) for aggregation. Minimum required: ${this.minPeersForAggregation}. Skipping aggregation.`);
       return;
@@ -409,56 +363,40 @@ export class FederatedTrainerWorker {
 
     console.log('Starting federated delta aggregation...');
 
-    await tf.tidy(async () => {
-      // The base model for aggregation is the last aggregated global model
-      const baseGlobalModelTensors = serializableWeightsToTensors(this.lastAggregatedWeights!); // Guaranteed not null
+    tf.engine().startScope();
+    try {
+      const baseGlobalModelTensors = await serializableWeightsToTensors(this.lastAggregatedWeights!);
 
-      // Get the local model's current weights (after its local training)
       const currentLocalSerializableWeights = await this.nerfModelWorker!.getWeights();
-      const currentLocalTensors = serializableWeightsToTensors(currentLocalSerializableWeights);
+      const currentLocalTensors = await serializableWeightsToTensors(currentLocalSerializableWeights);
 
-      // Calculate the local delta: (current local model) - (last global model)
       const localDeltaTensors = currentLocalTensors.map((localT, i) => localT.sub(baseGlobalModelTensors[i]));
 
-      // Collect all deltas (local + received from peers)
       const allDeltasTensors: tf.Tensor[][] = [localDeltaTensors];
       for (const peerSerializableDelta of this.receivedWeightsBuffer.values()) {
-        allDeltasTensors.push(serializableWeightsToTensors(peerSerializableDelta));
+        allDeltasTensors.push(await serializableWeightsToTensors(peerSerializableDelta));
       }
 
       if (allDeltasTensors.length === 0) {
         console.warn('No deltas available for aggregation.');
-        baseGlobalModelTensors.forEach(t => t.dispose());
-        currentLocalTensors.forEach(t => t.dispose());
-        localDeltaTensors.forEach(t => t.dispose());
         return;
       }
 
-      // Ensure all delta sets have the same structure and length as the base model
       const numDeltaSets = allDeltasTensors.length;
       const numTensors = baseGlobalModelTensors.length;
       for (let i = 0; i < numDeltaSets; i++) {
         if (allDeltasTensors[i].length !== numTensors) {
           console.error('Delta weight sets have inconsistent number of tensors. Skipping aggregation.');
-          allDeltasTensors.flat().forEach(t => t.dispose());
-          baseGlobalModelTensors.forEach(t => t.dispose());
-          currentLocalTensors.forEach(t => t.dispose());
-          localDeltaTensors.forEach(t => t.dispose());
           return;
         }
         for (let j = 0; j < numTensors; j++) {
           if (!tf.util.arraysEqual(allDeltasTensors[i][j].shape, baseGlobalModelTensors[j].shape)) {
             console.error(`Delta tensor ${j} has inconsistent shape across peers. Expected ${JSON.stringify(baseGlobalModelTensors[j].shape)}, got ${JSON.stringify(allDeltasTensors[i][j].shape)}. Skipping aggregation.`);
-            allDeltasTensors.flat().forEach(t => t.dispose());
-            baseGlobalModelTensors.forEach(t => t.dispose());
-            currentLocalTensors.forEach(t => t.dispose());
-            localDeltaTensors.forEach(t => t.dispose());
             return;
           }
         }
       }
 
-      // Average the deltas
       const averagedDeltaTensors: tf.Tensor[] = [];
       for (let i = 0; i < numTensors; i++) {
         let sumDeltaTensor = tf.zerosLike(baseGlobalModelTensors[i]);
@@ -468,18 +406,15 @@ export class FederatedTrainerWorker {
         averagedDeltaTensors.push(sumDeltaTensor.div(numDeltaSets));
       }
 
-      // Apply the averaged delta to the base global model to get the new aggregated global model
       const newAggregatedGlobalTensors: tf.Tensor[] = baseGlobalModelTensors.map((baseT, i) =>
         baseT.add(averagedDeltaTensors[i])
       );
 
-      const newAggregatedSerializableWeights = tensorsToSerializableWeights(newAggregatedGlobalTensors);
+      const newAggregatedSerializableWeights = await tensorsToSerializableWeights(newAggregatedGlobalTensors);
 
-      // Apply aggregated weights to the local model
       await this.nerfModelWorker!.setWeights(Comlink.transfer(newAggregatedSerializableWeights, [newAggregatedSerializableWeights.weightData]));
       console.log('Federated delta aggregation complete. Model updated.');
 
-      // Update lastAggregatedWeights
       this.lastAggregatedWeights = newAggregatedSerializableWeights;
 
       const trainingMetrics: TrainingMetrics = await this.nerfModelWorker!.getTrainingMetrics();
@@ -488,28 +423,21 @@ export class FederatedTrainerWorker {
       const newModelVersion = latestCheckpoint ? latestCheckpoint.modelVersion + 1 : 1;
 
       await this.nerfDatabaseService.saveModelCheckpoint(
-        newAggregatedSerializableWeights, // Save the new aggregated weights
+        newAggregatedSerializableWeights,
         newModelVersion,
         trainingMetrics.epoch,
         trainingMetrics.loss,
         trainingMetrics.metrics
       );
       console.log(`Aggregated model checkpoint saved with version: ${newModelVersion}.`);
+    } finally {
+        tf.engine().endScope();
+    }
 
-      // Dispose of all intermediate tensors
-      baseGlobalModelTensors.forEach(t => t.dispose());
-      currentLocalTensors.forEach(t => t.dispose());
-      localDeltaTensors.forEach(t => t.dispose());
-      allDeltasTensors.flat().forEach(t => t.dispose());
-      averagedDeltaTensors.forEach(t => t.dispose());
-      newAggregatedGlobalTensors.forEach(t => t.dispose());
-    });
-
-    this.receivedWeightsBuffer.clear(); // Clear buffer after aggregation
+    this.receivedWeightsBuffer.clear();
   }
 
   async getCommunicationSchedule(): Promise<FederatedSchedule> {
-    // CQ-FTW-001: These parameters are now dynamically configurable via setCommunicationSchedule.
     return {
       iterationsPerRound: this.iterationsPerRound,
       aggregationIntervalMs: this.aggregationIntervalMs,
